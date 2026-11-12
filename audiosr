@@ -138,6 +138,8 @@ def find_python():
     if env:
         candidates.append(os.path.expanduser(env))
     candidates.append(os.path.join(SCRIPT_DIR, "venv", "bin", "python"))
+    if os.name == "nt":
+        candidates.append(os.path.join(SCRIPT_DIR, "venv", "Scripts", "python.exe"))
     if COMFYUI_DIR:
         candidates.append(os.path.join(COMFYUI_DIR, "venv", "bin", "python"))
     for candidate in candidates:
@@ -154,6 +156,10 @@ def reexec_with_venv():
     if not VENV_PYTHON or not os.path.isfile(VENV_PYTHON):
         return
     if not os.access(VENV_PYTHON, os.X_OK):
+        return
+    if os.name == "nt":
+        # os.execve does not replace the process cleanly on Windows; run the
+        # venv interpreter explicitly instead (audiosr.cmd does this).
         return
     if os.environ.get("AUDIOSR_REEXEC") == "1":
         return
@@ -318,11 +324,44 @@ def preflight(args):
     else:
         gate.ok("device", "cpu (explicitly requested)")
 
-    running = subprocess.run(
-        ["pgrep", "-af", "ComfyUI/main.py"], capture_output=True, text=True
-    ).stdout.strip()
-    if running:
-        gate.warn("ComfyUI is running", "it may be holding VRAM; the run can still fit")
+    if os.name != "nt":
+        try:
+            running = subprocess.run(
+                ["pgrep", "-af", "ComfyUI/main.py"], capture_output=True, text=True
+            ).stdout.strip()
+        except OSError:
+            running = ""
+        if running:
+            gate.warn("ComfyUI is running", "it may be holding VRAM; the run can still fit")
+
+    backend = resolve_backend(args)
+    needs_audio = args.listen or (args.play and not args.dump)
+    if needs_audio:
+        if backend == "pulse":
+            missing = [name for name in ("pacat", "pactl") if not _have(name)]
+            if args.listen and not _have("parec"):
+                missing.append("parec")
+            if missing:
+                gate.fail("pulse backend", f"missing {', '.join(missing)} (install pulseaudio-utils)")
+            else:
+                gate.ok("backend", "pulse (pacat/parec/pactl)")
+        else:
+            if not _module_available("sounddevice"):
+                gate.fail("portaudio backend", "missing sounddevice (pip install sounddevice)")
+            else:
+                gate.ok("backend", "portaudio (sounddevice)")
+            if args.listen and not args.input_device:
+                gate.fail(
+                    "capture device",
+                    "--listen with the portaudio backend needs --input-device "
+                    "(run --list-devices)",
+                )
+        if args.play:
+            missing = [name for name in ("ffmpeg", "ffprobe") if not _have(name)]
+            if missing:
+                gate.fail("ffmpeg", f"missing {', '.join(missing)} on PATH (needed to decode input)")
+            else:
+                gate.ok("ffmpeg", shutil.which("ffmpeg"))
 
     info = {
         "comfyui": COMFYUI_DIR,
@@ -331,6 +370,7 @@ def preflight(args):
         "node_dir": node_dir,
         "model_dir": model_dir,
         "device": device,
+        "backend": backend,
     }
     if not _finish_gate(gate, args):
         return None
@@ -342,7 +382,9 @@ def _finish_gate(gate, args):
         print("[audiosr] Preflight failed:")
         for failure in gate.failures:
             print(f"  - {failure}")
-        if args.engine == "flashsr":
+        if args.engine == "flashsr" and any(
+            "weights" in failure.lower() for failure in gate.failures
+        ):
             print(
                 "\n[audiosr] Missing FlashSR weights? Re-run with --download:\n"
                 f"  {FLASHSR_URL.format(repo=FLASHSR_REPO, name='student_ldm.pth')}\n"
@@ -621,6 +663,7 @@ def _upscale_vasr_channel(model, channel, args, label):
 
 def probe_audio(path):
     """Return (channels, duration_seconds) for the first audio stream."""
+    _require("ffprobe", "install ffmpeg")
     proc = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "a:0",
          "-show_entries", "stream=channels", "-show_entries", "format=duration",
@@ -658,6 +701,7 @@ def _pcm_blocks(proc, channels):
 
 def decode_pcm(path, channels):
     """Decode a file to 48 kHz float32 blocks via ffmpeg."""
+    _require("ffmpeg", "install ffmpeg")
     proc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "a:0",
          "-f", "f32le", "-acodec", "pcm_f32le",
@@ -667,7 +711,7 @@ def decode_pcm(path, channels):
     yield from _pcm_blocks(proc, channels)
 
 
-def open_sink(args, channels, label):
+def open_sink(args, channels, label, backend="pulse"):
     """Return (write, close) callables for the chosen output."""
     if args.dump:
         import soundfile as sf
@@ -683,6 +727,105 @@ def open_sink(args, channels, label):
 
         return write, close
 
+    if backend == "portaudio":
+        return _open_portaudio_sink(args, channels)
+    return _open_pulse_sink(args, channels, label)
+
+
+# ---------------------------------------------------------------------------
+# Audio backends
+# ---------------------------------------------------------------------------
+
+def _have(binary):
+    return shutil.which(binary) is not None
+
+
+def _require(binary, hint):
+    if not _have(binary):
+        sys.exit(f"[audiosr] {binary} not found on PATH ({hint})")
+
+
+def resolve_backend(args):
+    """Pick the audio backend: explicit, else PulseAudio when it is available."""
+    if getattr(args, "backend", "auto") != "auto":
+        return args.backend
+    if os.name == "nt":
+        return "portaudio"
+    return "pulse" if _have("pacat") and _have("pactl") else "portaudio"
+
+
+def _sounddevice():
+    try:
+        import sounddevice as sd
+    except ImportError:
+        sys.exit("[audiosr] the portaudio backend needs sounddevice:\n  pip install sounddevice")
+    return sd
+
+
+def _resolve_device(sd, spec, kind):
+    """Turn a PortAudio index or name substring into a device index."""
+    if spec in (None, ""):
+        return None
+    channels_key = "max_output_channels" if kind == "output" else "max_input_channels"
+    devices = sd.query_devices()
+    if str(spec).isdigit():
+        index = int(spec)
+        if 0 <= index < len(devices) and devices[index][channels_key] > 0:
+            return index
+        sys.exit(f"[audiosr] {kind} device {index} does not exist or has no {kind} channels")
+    matches = [
+        index for index, device in enumerate(devices)
+        if str(spec).lower() in device["name"].lower() and device[channels_key] > 0
+    ]
+    if not matches:
+        sys.exit(f"[audiosr] no {kind} device matching {spec!r}; run 'audiosr --list-devices'")
+    if len(matches) > 1:
+        listing = "\n".join(
+            f"  {index}: {devices[index]['name']} "
+            f"({sd.query_hostapis(devices[index]['hostapi'])['name']})"
+            for index in matches
+        )
+        sys.exit(f"[audiosr] {spec!r} matches several {kind} devices:\n{listing}")
+    return matches[0]
+
+
+def list_devices(args):
+    """Print the devices the active backend can play to and capture from."""
+    backend = resolve_backend(args)
+    if backend == "pulse":
+        _require("pactl", "install pulseaudio-utils")
+        proc = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True)
+        if proc.returncode != 0:
+            sys.exit(f"[audiosr] pactl failed: {proc.stderr.strip()}")
+        print("sinks (pulse backend):")
+        for line in proc.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 2:
+                print(f"  {fields[1]:<58} {' '.join(fields[4:])}")
+        print("\nuse: --sink <name>")
+        return 0
+
+    sd = _sounddevice()
+    print(f"host APIs: {', '.join(api['name'] for api in sd.query_hostapis())}")
+    default_in, default_out = sd.default.device
+    for index, device in enumerate(sd.query_devices()):
+        if not device["max_output_channels"] and not device["max_input_channels"]:
+            continue
+        marks = []
+        if index == default_out:
+            marks.append("default out")
+        if index == default_in:
+            marks.append("default in")
+        tag = f"  [{', '.join(marks)}]" if marks else ""
+        print(f"  {index:3d}  out={device['max_output_channels']} "
+              f"in={device['max_input_channels']}  {device['name']} "
+              f"({sd.query_hostapis(device['hostapi'])['name']}){tag}")
+    print("\nuse: --output-device <index|name>  /  --input-device <index|name>")
+    return 0
+
+
+def _open_pulse_sink(args, channels, label):
+    _require("pacat", "install pulseaudio-utils, or use --backend portaudio")
     cmd = [
         "pacat", "--playback", "--raw",
         f"--format=float32le", f"--rate={SAMPLE_RATE}", f"--channels={channels}",
@@ -705,6 +848,110 @@ def open_sink(args, channels, label):
         proc.wait()
 
     return write, close
+
+
+def _open_stream(sd, kind, device, channels, latency):
+    """Open a 48 kHz float32 PortAudio stream.
+
+    Devices pinned to another rate (a 44.1 kHz virtual cable, a 32 kHz webcam)
+    refuse 48 kHz. On WASAPI, shared mode can convert for us; elsewhere we fail
+    with an actionable message instead of a bare PortAudio error.
+    """
+    factory = sd.OutputStream if kind == "output" else sd.InputStream
+    options = dict(samplerate=SAMPLE_RATE, channels=channels, dtype="float32",
+                   device=device, latency=latency)
+    try:
+        stream = factory(**options)
+        stream.start()
+        return stream
+    except Exception as exc:
+        first = exc
+
+    index = device
+    if index is None:
+        try:
+            index = sd.default.device[0 if kind == "input" else 1]
+        except Exception:
+            index = None
+    if index is not None and index >= 0 and hasattr(sd, "WasapiSettings"):
+        api = sd.query_hostapis(sd.query_devices(index)["hostapi"])["name"]
+        if "wasapi" in api.lower():
+            try:
+                stream = factory(**options,
+                                 extra_settings=sd.WasapiSettings(auto_convert=True))
+                stream.start()
+                return stream
+            except Exception:
+                pass
+
+    sys.exit(
+        f"[audiosr] could not open the {kind} device at {SAMPLE_RATE} Hz: {first}\n"
+        f"  set it to {SAMPLE_RATE} Hz in the system sound settings, or pick a "
+        f"different device (audiosr --list-devices)"
+    )
+
+
+def _open_portaudio_sink(args, channels):
+    import numpy as np
+
+    sd = _sounddevice()
+    device = _resolve_device(sd, args.output_device, "output")
+    stream = _open_stream(sd, "output", device, channels, args.latency / 1000.0)
+
+    def write(block):
+        stream.write(np.ascontiguousarray(block.T, dtype=np.float32))
+
+    def close():
+        try:
+            stream.stop()
+        finally:
+            stream.close()
+
+    return write, close
+
+
+def _sd_blocks(stream, channels):
+    """Yield float32 blocks from a sounddevice input stream."""
+    import numpy as np
+
+    while True:
+        data, overflowed = stream.read(WRITE_CHUNK)
+        if overflowed:
+            print("[audiosr] capture overflow; dropped audio", flush=True)
+        yield np.ascontiguousarray(data.T, dtype=np.float32)
+
+
+def _start_writer(write, close):
+    """Push blocks into a blocking sink from a thread.
+
+    Writing to a realtime sink blocks, so doing it on the inference thread
+    serializes playback with compute and drops the stream below realtime.
+    Returns (put, finish, failures).
+    """
+    queue_ = queue.Queue(maxsize=1)
+    failures = []
+
+    def run():
+        try:
+            while True:
+                block = queue_.get()
+                if block is None:
+                    break
+                for start in range(0, block.shape[1], WRITE_CHUNK):
+                    write(block[:, start:start + WRITE_CHUNK])
+        except Exception as exc:  # broken pipe when the listener goes away
+            failures.append(exc)
+        finally:
+            close()
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+
+    def finish():
+        queue_.put(None)
+        thread.join()
+
+    return queue_.put, finish, failures
 
 
 def _xfade(n, fade_in):
@@ -844,6 +1091,13 @@ def _pactl(*args, capture=False):
 
 
 def listen(args):
+    """Middleware mode: upscale whatever an application routes into us."""
+    if resolve_backend(args) == "portaudio":
+        return _listen_portaudio(args)
+    return _listen_pulse(args)
+
+
+def _listen_pulse(args):
     """Middleware mode: create a virtual sink, upscale whatever is routed to it.
 
     Any application can then play into the sink (or set it as the default) and
@@ -853,6 +1107,8 @@ def listen(args):
     info = preflight(args)
     if info is None:
         return 1
+    if args.check:
+        return 0
 
     import warnings
 
@@ -896,11 +1152,7 @@ def listen(args):
     print(f"[audiosr] Window {args.window}s -> ~{args.window + 1.9:.1f}s latency. Ctrl-C to stop.",
           flush=True)
 
-    # SIGTERM must run the cleanup path too, or the virtual sink is left behind.
-    def _on_term(signum, frame):
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, _on_term)
+    _install_term_handler()
 
     source = subprocess.Popen(
         ["parec", f"--device={virtual}.monitor", "--format=float32le",
@@ -909,25 +1161,8 @@ def listen(args):
     )
 
     started = time.time()
-    write, close = open_sink(args, 2, f"audiosr-sink: {virtual}")
-    queue_ = queue.Queue(maxsize=1)
-    failures = []
-
-    def writer():
-        try:
-            while True:
-                block = queue_.get()
-                if block is None:
-                    break
-                for start in range(0, block.shape[1], WRITE_CHUNK):
-                    write(block[:, start:start + WRITE_CHUNK])
-        except Exception as exc:
-            failures.append(exc)
-        finally:
-            close()
-
-    thread = threading.Thread(target=writer, daemon=True)
-    thread.start()
+    write, close = open_sink(args, 2, f"audiosr-sink: {virtual}", backend="pulse")
+    put, finish, failures = _start_writer(write, close)
 
     model = load_flashsr(info["pkg_dir"], info["model_dir"], info["device"])
     _silence_tqdm()
@@ -937,13 +1172,12 @@ def listen(args):
         for block in stream_upscale(model, _pcm_blocks(source, 2), args, 2):
             if failures:
                 break
-            queue_.put(block)
+            put(block)
     except KeyboardInterrupt:
         pass
     finally:
         source.terminate()
-        queue_.put(None)
-        thread.join()
+        finish()
         if args.take_default and original_default:
             _pactl("set-default-sink", original_default)
             print(f"[audiosr] Default sink restored to {original_default}")
@@ -952,11 +1186,96 @@ def listen(args):
     return 0
 
 
-def play(args):
-    """Stream an audio file through FlashSR into a PulseAudio sink (or FLAC)."""
+def _listen_portaudio(args):
+    """Middleware mode without a sound server.
+
+    PortAudio cannot create a virtual sink, so routing is external: send the
+    apps into a virtual cable (VB-Cable / VoiceMeeter on Windows, snd-aloop or
+    a PipeWire loopback on Linux) and capture that device.
+    """
     info = preflight(args)
     if info is None:
         return 1
+    if args.check:
+        return 0
+    if not args.input_device:
+        sys.exit(
+            "[audiosr] --listen with the portaudio backend needs --input-device:\n"
+            "  route your apps into a virtual cable and capture it, e.g.\n"
+            '    audiosr --listen --input-device "CABLE Output" --output-device "Speakers"\n'
+            "  (run 'audiosr --list-devices' to see the names)"
+        )
+    if args.take_default:
+        print("[audiosr] --take-default is PulseAudio-only; ignored on this backend")
+
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    window = int(round(args.window * SAMPLE_RATE))
+    if window % FLASHSR_GRANULE or window < FLASHSR_GRANULE:
+        sys.exit(
+            f"[audiosr] --window must be a multiple of {FLASHSR_GRANULE / SAMPLE_RATE:.2f}s "
+            f"and at least that long; got {args.window}s"
+        )
+
+    sd = _sounddevice()
+    device = _resolve_device(sd, args.input_device, "input")
+    stream = _open_stream(sd, "input", device, 2, 0.2)
+
+    print(f"[audiosr] Capturing: {args.input_device}")
+    print(f"[audiosr] Playing into: {args.output_device or 'default output'}")
+    print(f"[audiosr] Window {args.window}s -> ~{args.window + 1.9:.1f}s latency. Ctrl-C to stop.",
+          flush=True)
+
+    _install_term_handler()
+
+    started = time.time()
+    write, close = open_sink(args, 2, "audiosr-sink", backend="portaudio")
+    put, finish, failures = _start_writer(write, close)
+
+    model = load_flashsr(info["pkg_dir"], info["model_dir"], info["device"])
+    _silence_tqdm()
+    print(f"[audiosr] Model loaded in {time.time() - started:.1f}s, listening...", flush=True)
+
+    try:
+        for block in stream_upscale(model, _sd_blocks(stream, 2), args, 2):
+            if failures:
+                break
+            put(block)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        finish()
+    return 0
+
+
+def _install_term_handler():
+    """Make SIGTERM run the cleanup path too, or the virtual sink is left behind."""
+    if not hasattr(signal, "SIGTERM"):
+        return
+
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except (ValueError, OSError):
+        pass
+
+
+def play(args):
+    """Stream an audio file through FlashSR into an audio device (or FLAC)."""
+    info = preflight(args)
+    if info is None:
+        return 1
+    if args.check:
+        return 0
 
     import warnings
 
@@ -979,40 +1298,27 @@ def play(args):
     if args.overlap * SAMPLE_RATE >= window / 2:
         sys.exit("[audiosr] --overlap must be less than half the window")
 
+    backend = info["backend"]
     print(f"[audiosr] Engine: FlashSR (1-step, {args.dtype}), window={args.window}s, "
           f"overlap={args.overlap}s, {channels}ch")
     print(f"[audiosr] Input:  {args.input} ({duration:.1f}s)")
     if not args.dump:
-        print(f"[audiosr] Sink:   {args.sink}")
+        if backend == "pulse":
+            target = args.sink
+        else:
+            target = f"{args.output_device or 'default'} (portaudio)"
+        print(f"[audiosr] Output: {target}")
         print(f"[audiosr] Latency: ~{args.window + 1.9:.1f}s "
               f"(window buffer + inference at RTF 0.37)")
 
     started = time.time()
     label = f"audiosr: {os.path.basename(args.input)[:48]}"
-    write, close = open_sink(args, channels, label)
+    # Opening the sink first starts the device resuming while the weights load.
+    write, close = open_sink(args, channels, label, backend=backend)
 
-    # The sink only accepts audio at playback rate, so writes block. Push them
-    # onto a writer thread: otherwise the blocking write serializes with
-    # inference and the stream falls behind realtime. Opening the sink first
-    # also starts the device resuming while the weights load.
-    queue_ = queue.Queue(maxsize=1)
-    failures = []
-
-    def writer():
-        try:
-            while True:
-                block = queue_.get()
-                if block is None:
-                    break
-                for start in range(0, block.shape[1], WRITE_CHUNK):
-                    write(block[:, start:start + WRITE_CHUNK])
-        except Exception as exc:  # broken pipe when the listener goes away
-            failures.append(exc)
-        finally:
-            close()
-
-    thread = threading.Thread(target=writer, daemon=True)
-    thread.start()
+    # Writes block at playback rate, so they run on their own thread: otherwise
+    # they serialize with inference and the stream falls behind realtime.
+    put, finish, failures = _start_writer(write, close)
 
     model = load_flashsr(info["pkg_dir"], info["model_dir"], info["device"])
     _silence_tqdm()
@@ -1024,13 +1330,12 @@ def play(args):
         for block in stream_upscale(model, decode_pcm(args.input, channels), args, channels):
             if failures:
                 break
-            queue_.put(block)
+            put(block)
             total += block.shape[1]
     except KeyboardInterrupt:
         interrupted = True
     finally:
-        queue_.put(None)
-        thread.join()
+        finish()
 
     if failures and not interrupted:
         print(f"[audiosr] Playback stopped: {failures[0]}")
@@ -1085,10 +1390,20 @@ def build_parser():
     parser.add_argument("--check", action="store_true",
                         help="run the install/GPU/model preflight gate and exit")
     parser.add_argument("--play", action="store_true",
-                        help="stream through FlashSR to a PulseAudio/PipeWire sink "
-                             "instead of writing a file")
+                        help="stream through FlashSR to an audio device instead of "
+                             "writing a file")
     parser.add_argument("--sink", default="@DEFAULT_SINK@",
-                        help="[--play] PulseAudio sink name (pacat --device)")
+                        help="[pulse backend] sink name (pacat --device)")
+    parser.add_argument("--backend", default="auto", choices=["auto", "pulse", "portaudio"],
+                        help="[--play/--listen] audio backend; auto uses pulse when "
+                             "pacat/pactl exist, otherwise portaudio")
+    parser.add_argument("--output-device", default=None,
+                        help="[portaudio] output device (index or name substring)")
+    parser.add_argument("--input-device", default=None,
+                        help="[portaudio --listen] capture device, e.g. a virtual cable")
+    parser.add_argument("--list-devices", "--list-sinks", dest="list_devices",
+                        action="store_true",
+                        help="list audio devices for the active backend and exit")
     parser.add_argument("--window", type=float, default=5.12,
                         help="[--play] FlashSR window in seconds (multiple of 0.64; "
                              "5.12 = trained length, smaller = lower latency)")
@@ -1103,10 +1418,11 @@ def build_parser():
                         help="[--play] write the streamed result to this FLAC "
                              "instead of playing it")
     parser.add_argument("--listen", action="store_true",
-                        help="middleware mode: create a virtual sink, upscale whatever "
-                             "is routed into it, and play it on the real sink")
+                        help="middleware mode: upscale whatever is routed into us "
+                             "(pulse: creates a virtual sink; portaudio: captures "
+                             "--input-device)")
     parser.add_argument("--virtual-name", default="audiosr_in",
-                        help="[--listen] name of the virtual sink to create")
+                        help="[pulse --listen] name of the virtual sink to create")
     parser.add_argument("--skip-silence", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="pass digital silence through without a GPU pass "
@@ -1117,7 +1433,9 @@ def build_parser():
         "The FlashSR package is looked up in $FLASHSR_DIR, ./flashsr, "
         "./vendor/flashsr, and ComfyUI custom_nodes (set COMFYUI_DIR or "
         "FLASHSR_DIR to override). Weights come from $FLASHSR_MODEL_DIR, "
-        "./models, or the ComfyUI models directory; --download fetches them."
+        "./models, or the ComfyUI models directory; --download fetches them. "
+        "Audio backends: pulse (pacat/parec/pactl, Linux) or portaudio "
+        "(sounddevice; ALSA/Pulse on Linux, WASAPI on Windows, CoreAudio on macOS)."
     )
     return parser
 
@@ -1126,6 +1444,8 @@ def main():
     args = build_parser().parse_args()
     reexec_with_venv()
 
+    if args.list_devices:
+        return list_devices(args)
     if args.listen:
         return listen(args)
     if args.play:

@@ -9,8 +9,12 @@ Three ways to use it:
 | command | what it does |
 |---|---|
 | `audiosr in.mp3 out.flac` | batch upscale a file (windowed, crossfaded) |
-| `audiosr-play track.mp3` | upscale a file and play it live on a PulseAudio/PipeWire sink — no intermediate file |
+| `audiosr-play track.mp3` | upscale a file and play it live on an audio device — no intermediate file |
 | `audiosr-sink` | create a virtual sink, upscale everything routed into it, play it on the real device |
+
+Two audio backends: **pulse** (`pacat`/`parec`/`pactl`, the default on Linux)
+and **portaudio** ([sounddevice](https://python-sounddevice.readthedocs.io/);
+ALSA/Pulse on Linux, WASAPI on Windows, CoreAudio on macOS).
 
 FlashSR is a *one-step* diffusion model, so a 5.12 s window costs a single UNet
 forward plus a vocoder pass. On an RTX 4060 Ti that is **0.96 s for mono and
@@ -78,8 +82,46 @@ ComfyUI models directory if the weights are already there).
 ./install.sh             # symlinks audiosr* into ~/.local/bin
 ```
 
-`ffmpeg` is required for the streaming modes, and `pacat`/`parec`/`pactl`
-(`pulseaudio-utils`) for the sink modes.
+`ffmpeg` is required for the streaming modes. For `--play`/`--listen` you also
+need one of the two audio backends:
+
+* **pulse** (default on Linux): `pacat`/`parec`/`pactl` from `pulseaudio-utils`.
+* **portaudio**: `pip install sounddevice` (already in `requirements.txt`).
+
+### 5. Windows
+
+Everything works on Windows except that there is no user-space virtual sink.
+Run the `.cmd` wrappers, which pick up `venv\Scripts\python.exe`:
+
+```bat
+python -m venv venv
+venv\Scripts\pip install torch --index-url https://download.pytorch.org/whl/cu124
+venv\Scripts\pip install -r requirements.txt
+
+audiosr.cmd --check
+rem batch upscale
+audiosr.cmd in.mp3 out.flac
+rem live WASAPI playback
+audiosr-play.cmd track.mp3
+```
+
+`--play` uses WASAPI through PortAudio; `audiosr-play.cmd --list-devices` shows
+the device indices/names for `--output-device`. For `--listen` (middleware
+mode) install a virtual cable such as
+[VB-CABLE](https://vb-audio.com/Cable/) or VoiceMeeter, send your apps into the
+cable, and capture its output side:
+
+```bat
+audiosr-sink.cmd --input-device "CABLE Output" --output-device "Speakers"
+```
+
+macOS works the same way through CoreAudio (`pip install sounddevice`), with
+[BlackHole](https://existential.audio/blackhole/) as the virtual cable.
+
+Both the capture and playback device must accept 48 kHz float32. On WASAPI the
+shared-mode converter is used automatically when a device is pinned to 44.1 kHz;
+on Linux use the `pulse`/`pipewire` ALSA plugin (or set the hardware to 48 kHz)
+if a bare `hw:` device refuses the rate.
 
 ---
 
@@ -98,6 +140,9 @@ audiosr-play track.mp3
 # lower latency (2.56 s window), pick a device
 audiosr-play track.mp3 --window 2.56 --sink alsa_output.pci-0000_0d_00.4.iec958-stereo
 
+# same, through PortAudio instead of PulseAudio
+audiosr-play track.mp3 --backend portaudio --output-device "HD-Audio Generic: ALC897 Digital"
+
 # same pipeline, but write FLAC instead of playing
 audiosr-play track.mp3 --dump out.flac
 
@@ -107,7 +152,8 @@ audiosr-sink --take-default        # ...and makes it the default while running
 pactl move-sink-input <id> audiosr_in
 ```
 
-`audiosr-play --list-sinks` prints the available sinks.
+`audiosr --list-devices` prints what the active backend can play to (and, on
+portaudio, capture from); `--list-sinks` is an alias.
 
 ### Useful flags
 
@@ -120,6 +166,11 @@ pactl move-sink-input <id> audiosr_in
 | `--no-lowpass` | feed the model the unmodified signal |
 | `--skip-silence` | pass digital silence through without a GPU pass (keeps an idle daemon at ~1% GPU) |
 | `--device cpu` | run on CPU (works, but see the numbers below) |
+| `--backend pulse\|portaudio` | audio backend; `auto` (default) uses pulse when `pacat`/`pactl` exist, else portaudio |
+| `--sink NAME` | [pulse] output sink for `--play`/`--listen` |
+| `--output-device DEV` | [portaudio] output device index or name substring |
+| `--input-device DEV` | [portaudio `--listen`] capture device, e.g. a virtual cable |
+| `--list-devices` | list devices for the active backend and exit |
 
 ---
 
@@ -127,7 +178,7 @@ pactl move-sink-input <id> audiosr_in
 
 ```
 file ──ffmpeg──┐
-               ├─> ring buffer ─> 5.12 s window ─> FlashSR (bf16) ─> RMS match ─> cosine crossfade ─> pacat ─> sink
+               ├─> ring buffer ─> 5.12 s window ─> FlashSR (bf16) ─> RMS match ─> cosine crossfade ─> pacat / sounddevice ─> device
 sink.monitor ──┘                 (advance by window − overlap)      (gain clamp)     (overlap)
 ```
 
@@ -141,8 +192,10 @@ sink.monitor ──┘                 (advance by window − overlap)      (gai
 * Writes go through a writer thread in 0.25 s chunks. Writing to a realtime sink
   blocks; doing that on the inference thread serializes playback with compute and
   drops the stream below realtime (RTF 1.47 instead of 0.37).
-* `--listen` resolves and pins `@DEFAULT_SINK@` *before* `--take-default`
-  switches the default, so the daemon can never feed itself.
+* `--listen` on the pulse backend resolves and pins `@DEFAULT_SINK@` *before*
+  `--take-default` switches the default, so the daemon can never feed itself.
+  On the portaudio backend there is no virtual sink to create: capture comes
+  from `--input-device`, so the routing is external (see Windows above).
 
 Latency is **window + inference time**: about 6–7 s at the default 5.12 s
 window, ~2.8 s at 1.28 s. This is music/podcast tooling — it cannot track video
@@ -176,8 +229,8 @@ bandwidth-bound and already runs on fused SDPA kernels. Details in
 That set was verified in a clean venv: `transformers`, `timm`, `torchaudio` and
 `safetensors` are **not** needed for the FlashSR path (they are only pulled in by
 the optional `--engine audiosr` fallback). No ComfyUI, no diffusers, no
-`xformers`/`sageattention`. `ffmpeg` for the streaming modes;
-`pulseaudio-utils` for the sink modes.
+`xformers`/`sageattention`. `ffmpeg` for the streaming modes; `sounddevice` for
+the portaudio backend, `pulseaudio-utils` for the pulse backend.
 
 **Minimum hardware:** any CUDA GPU with ~4 GB free VRAM for stereo bf16 (2.9 GB
 peak at a 0.64 s window, 3.7 GB at 5.12 s). For *realtime* streaming you need
@@ -185,10 +238,18 @@ roughly RTF < 0.8 to leave headroom: an RTX 3060-class card (~2× slower than a
 4060 Ti) lands around RTF 0.7 and is the practical floor. Anything older/slower
 will still do batch upscaling, just not live playback.
 
-**OS:** the batch mode is pure Python + ffmpeg and runs anywhere torch does.
-`--play`/`--listen` are Linux-only because they drive PulseAudio/PipeWire
-directly (`pacat`, `parec`, `pactl`). macOS would need a CoreAudio/BlackHole
-equivalent, Windows a WASAPI loopback equivalent; the DSP path itself is portable.
+**OS:** all three modes run on Linux, Windows and macOS.
+
+| | batch | `--play` | `--listen` |
+|---|---|---|---|
+| Linux (pulse) | yes | yes | yes — creates a null sink |
+| Linux (portaudio) | yes | yes | yes — external loopback (`snd-aloop`, PipeWire loopback) |
+| Windows | yes | yes (WASAPI) | yes — needs VB-CABLE/VoiceMeeter |
+| macOS | yes | yes (CoreAudio) | yes — needs BlackHole |
+
+Windows and macOS have no user-space virtual sink, so middleware mode there
+captures an external virtual cable instead of creating a sink. Only the pulse
+backend is Linux-specific; the DSP path and the portaudio backend are portable.
 
 CPU-only works but is 2–9× slower than realtime (0.64 s mono window: RTF 2.0;
 5.12 s stereo: RTF 8.7, ~6 GB RAM), so batch only. Full tables in

@@ -12,6 +12,10 @@ matplotlib
 tqdm
 huggingface_hub
 
+# PortAudio backend (--backend portaudio): ALSA/Pulse on Linux, WASAPI on
+# Windows, CoreAudio on macOS. Not needed for batch mode or the pulse backend.
+sounddevice>=0.4.6
+
 # The FlashSR inference package itself is not on PyPI. Either:
 #   pip install git+https://github.com/jakeoneijk/FlashSR_Inference
 # or clone it into ./flashsr (see README).

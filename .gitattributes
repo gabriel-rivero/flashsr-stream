@@ -1,0 +1,2 @@
+# Keep the Windows wrappers with CRLF endings regardless of the checkout OS.
+*.cmd text eol=crlf

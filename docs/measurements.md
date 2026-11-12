@@ -82,3 +82,25 @@ Stereo at 5.12 s uses 0.37 of a 4060 Ti, so a card roughly 2× slower still
 works — that puts the practical floor around an RTX 3060 / 8 GB. Cards with
 4 GB can still stream if the window is kept at 0.64–1.28 s (2.86–2.98 GB peak).
 Below that, batch mode only.
+
+## Audio backend cost
+
+The backend only moves already-upscaled float32 blocks, so it is not part of the
+inference budget. Both paths were exercised on the same machine (6 s stereo
+file, 5.12 s window, including ~9 s of model load):
+
+| backend | path | result |
+|---|---|---|
+| pulse | `pacat` → PipeWire sink | 6.0 s streamed in 60.3 s wall (2 windows + load) |
+| portaudio | `sounddevice` → ALSA `hw:1,1` | 6.0 s streamed in 17.3 s wall (2 windows + load) |
+
+The difference is device resume time, not throughput: the PulseAudio sink here
+runs 8× slower than realtime when resuming, while the onboard S/PDIF device is
+exactly realtime. Blocking writes are the reason both paths push through a
+writer thread; on the inference thread the same stream drops to RTF 1.47.
+
+`--list-devices` on this box reports 5 PulseAudio sinks and, under PortAudio,
+14 devices across the ALSA and OSS host APIs (the `sounddevice` wheels bundle
+PortAudio without the PulseAudio host API, so `pipewire`/`pulse` ALSA plugins are
+the way to reach the running sound server).
+
