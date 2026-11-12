@@ -27,7 +27,7 @@ AudioSR needs 50 diffusion steps and cannot keep up.
 Python 3.10–3.12 and a CUDA-capable PyTorch build:
 
 ```bash
-git clone <this repo> flashsr-stream
+git clone https://github.com/gabriel-rivero/flashsr-stream
 cd flashsr-stream
 
 python -m venv venv                       # or: uv venv
