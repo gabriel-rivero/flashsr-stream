@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# audiosr-sink: run FlashSR as a system-wide "middleware" sink.
+#
+# Creates a virtual PipeWire/PulseAudio sink (default name: audiosr_in), upscales
+# everything routed into it to 48 kHz with FlashSR, and plays the result on the
+# real sink. Nothing is written to disk.
+#
+# Usage:
+#   audiosr-sink                      # create audiosr_in, play on the real default
+#   audiosr-sink --take-default       # ...and make audiosr_in the default sink
+#   audiosr-sink --sink <real-sink>   # pick the output device explicitly
+#   audiosr-sink --window 2.56        # lower latency, less context
+#
+# While it runs, route apps in with:
+#   pactl move-sink-input <id> audiosr_in
+#
+# Latency is ~window + 2 s (about 7 s at the default 5.12 s window), so this is
+# for music and podcasts, not for keeping video in sync.
+set -euo pipefail
+
+exec "$(dirname "$(readlink -f "$0")")/audiosr" --listen "$@"

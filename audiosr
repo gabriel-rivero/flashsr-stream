@@ -1,0 +1,1217 @@
+#!/usr/bin/env python3
+"""Upscale audio to 48 kHz from the terminal with FlashSR (or AudioSR).
+
+This is a standalone wrapper around the FlashSR inference package:
+    https://github.com/jakeoneijk/FlashSR_Inference
+
+FlashSR is the default: a one-step distilled AudioSR that is roughly 9x faster
+than the diffusion sampler and peaks around 3.7 GB of VRAM (stereo, bf16).
+
+The package is looked up in $FLASHSR_DIR, ./flashsr, ./vendor/flashsr, and the
+usual ComfyUI custom_nodes locations, so the script works both as a standalone
+clone and inside an existing ComfyUI install. Weights come from $FLASHSR_MODEL_DIR,
+./models, or the ComfyUI models directory, and --download can fetch them.
+
+Every run starts with a preflight gate that probes the package, the interpreter,
+the model weights, and the GPU before loading anything.
+
+Examples:
+    audiosr track.mp3                       # -> track.flac next to the input
+    audiosr track.mp3 out.flac --overlap 1.5
+    audiosr track.mp3 --check               # only run the preflight gate
+    audiosr track.mp3 --download            # fetch missing FlashSR weights
+    audiosr track.mp3 --engine audiosr --model speech --steps 100
+
+Streaming (no intermediate file, plays as a PulseAudio/PipeWire stream):
+    audiosr --play track.mp3                # upscale and play on the default sink
+    audiosr --play track.mp3 --window 2.56  # lower latency, slightly less context
+    audiosr --play track.mp3 --sink my_sink --overlap 0.5
+    audiosr --play track.mp3 --dump out.flac  # same path, but write FLAC instead
+"""
+
+import argparse
+import importlib.util
+import queue
+import signal
+import threading
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+SAMPLE_RATE = 48000
+FLASHSR_WINDOW = 245760  # 5.12 s at 48 kHz, the window FlashSR was trained on
+FLASHSR_GRANULE = 30720  # 0.64 s: the smallest window the model accepts
+WRITE_CHUNK = 12000      # 0.25 s: keep the sink buffer near --latency
+FLASHSR_FILES = ("student_ldm.pth", "sr_vocoder.pth", "vae.pth")
+FLASHSR_SIZES = {
+    "student_ldm.pth": 1_033_200_174,
+    "sr_vocoder.pth": 627_861_067,
+    "vae.pth": 1_655_458_345,
+}
+FLASHSR_REPO = "jakeoneijk/FlashSR_weights"
+FLASHSR_URL = "https://huggingface.co/datasets/{repo}/resolve/main/{name}"
+VASR_MAX_DIRECT = 10.24
+VASR_MIN_CHUNK = 5.12
+
+
+# ---------------------------------------------------------------------------
+# Package / interpreter discovery and re-exec
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_flashsr_package(path):
+    """True if `path` holds the FlashSR inference package (FlashSR/ + TorchJaekwon/)."""
+    return bool(path) and os.path.isfile(os.path.join(path, "FlashSR", "FlashSR.py"))
+
+
+def find_flashsr_package():
+    """Return the directory that contains the FlashSR package, or None."""
+    candidates = []
+    env = os.environ.get("FLASHSR_DIR")
+    if env:
+        candidates.append(os.path.expanduser(env))
+    candidates += [
+        os.path.join(SCRIPT_DIR, "flashsr"),
+        os.path.join(SCRIPT_DIR, "vendor", "flashsr"),
+    ]
+    comfyui = find_comfyui()
+    if comfyui:
+        candidates.append(os.path.join(comfyui, "custom_nodes", "ComfyUI-AudioSR", "flashsr"))
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, "AI", "ComfyUI", "custom_nodes", "ComfyUI-AudioSR", "flashsr"),
+        os.path.join(home, "ComfyUI", "custom_nodes", "ComfyUI-AudioSR", "flashsr"),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        # Accept either the package dir itself or a checkout that contains it.
+        for root in (candidate, os.path.join(candidate, "flashsr")):
+            if _is_flashsr_package(root):
+                return os.path.abspath(root)
+    # Fall back to an installed copy (pip install git+.../FlashSR_Inference).
+    try:
+        spec = importlib.util.find_spec("FlashSR")
+    except (ImportError, ValueError):
+        spec = None
+    if spec and spec.origin:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(spec.origin)))
+        if _is_flashsr_package(root):
+            return root
+    return None
+
+
+def find_comfyui():
+    """Return the first directory that looks like a ComfyUI install."""
+    candidates = []
+    env = os.environ.get("COMFYUI_DIR")
+    if env:
+        candidates.append(os.path.expanduser(env))
+    home = os.path.expanduser("~")
+    candidates += [
+        os.path.join(home, "AI", "ComfyUI"),
+        os.path.join(home, "ComfyUI"),
+        os.path.join(home, "comfyui"),
+        "/opt/ComfyUI",
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if os.path.isfile(os.path.join(candidate, "main.py")) and os.path.isdir(
+            os.path.join(candidate, "custom_nodes")
+        ):
+            return os.path.abspath(candidate)
+    return None
+
+
+COMFYUI_DIR = find_comfyui()
+
+
+def find_python():
+    """Return an interpreter that has torch, preferring an explicit override."""
+    candidates = []
+    env = os.environ.get("AUDIOSR_PYTHON")
+    if env:
+        candidates.append(os.path.expanduser(env))
+    candidates.append(os.path.join(SCRIPT_DIR, "venv", "bin", "python"))
+    if COMFYUI_DIR:
+        candidates.append(os.path.join(COMFYUI_DIR, "venv", "bin", "python"))
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+VENV_PYTHON = find_python()
+
+
+def reexec_with_venv():
+    """Re-run under a project/ComfyUI venv so torch and the model deps are present."""
+    if not VENV_PYTHON or not os.path.isfile(VENV_PYTHON):
+        return
+    if not os.access(VENV_PYTHON, os.X_OK):
+        return
+    if os.environ.get("AUDIOSR_REEXEC") == "1":
+        return
+    if os.path.realpath(sys.executable) == os.path.realpath(VENV_PYTHON):
+        return
+    env = dict(os.environ)
+    env["AUDIOSR_REEXEC"] = "1"
+    os.execve(VENV_PYTHON, [VENV_PYTHON, os.path.abspath(__file__), *sys.argv[1:]], env)
+
+
+# ---------------------------------------------------------------------------
+# Preflight gate
+# ---------------------------------------------------------------------------
+
+class Gate:
+    def __init__(self):
+        self.failures = []
+        self.warnings = []
+
+    def ok(self, label, detail=""):
+        print(f"  [ok]   {label}{': ' + detail if detail else ''}")
+
+    def fail(self, label, detail=""):
+        print(f"  [FAIL] {label}{': ' + detail if detail else ''}")
+        self.failures.append(f"{label}: {detail}" if detail else label)
+
+    def warn(self, label, detail=""):
+        print(f"  [warn] {label}{': ' + detail if detail else ''}")
+        self.warnings.append(f"{label}: {detail}" if detail else label)
+
+
+def _module_available(name):
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def default_model_dir(engine):
+    """Pick a weights directory: env override, local ./models, then ComfyUI."""
+    env = os.environ.get("FLASHSR_MODEL_DIR")
+    if env:
+        return os.path.expanduser(env)
+    if engine != "flashsr":
+        if COMFYUI_DIR:
+            return os.path.join(COMFYUI_DIR, "models", "AudioSR")
+        return os.path.join(SCRIPT_DIR, "models", "AudioSR")
+    local = os.path.join(SCRIPT_DIR, "models")
+    comfyui = os.path.join(COMFYUI_DIR, "models", "flashsr") if COMFYUI_DIR else None
+    # Prefer whichever already holds weights; otherwise write into ./models.
+    for candidate in (local, comfyui):
+        if candidate and any(
+            os.path.isfile(os.path.join(candidate, name)) for name in FLASHSR_FILES
+        ):
+            return candidate
+    return local
+
+
+def preflight(args):
+    """Probe the package, interpreter, weights and the GPU.
+
+    Returns a dict with resolved paths. Exits non-zero if anything required is
+    missing. This runs before torch is imported so a broken install fails with a
+    readable message instead of an ImportError traceback.
+    """
+    print("[audiosr] Preflight gate")
+    gate = Gate()
+
+    gate.ok("python", f"{sys.executable} ({sys.version.split()[0]})")
+
+    pkg_dir = os.path.expanduser(args.node_dir) if args.node_dir else find_flashsr_package()
+    if pkg_dir and not _is_flashsr_package(pkg_dir):
+        nested = os.path.join(pkg_dir, "flashsr")
+        if _is_flashsr_package(nested):
+            pkg_dir = nested
+    if args.engine == "flashsr":
+        if pkg_dir is None:
+            gate.fail(
+                "FlashSR package",
+                "not found (set FLASHSR_DIR, pass --node-dir, or clone "
+                "https://github.com/jakeoneijk/FlashSR_Inference as ./flashsr)",
+            )
+        elif not _is_flashsr_package(pkg_dir):
+            gate.fail("FlashSR package", f"{pkg_dir} has no FlashSR/FlashSR.py")
+            pkg_dir = None
+        else:
+            gate.ok("FlashSR package", pkg_dir)
+
+    node_dir = (
+        os.path.join(COMFYUI_DIR, "custom_nodes", "ComfyUI-AudioSR") if COMFYUI_DIR else None
+    )
+    if args.engine == "audiosr":
+        if node_dir is None or not os.path.isdir(node_dir):
+            gate.fail(
+                "ComfyUI-AudioSR node",
+                "the AudioSR engine needs "
+                "https://github.com/gabriel-rivero/ComfyUI-AudioSR "
+                "(set COMFYUI_DIR); use the default --engine flashsr instead",
+            )
+        else:
+            entry = os.path.join(node_dir, "versatile_audio_super_resolution", "audiosr", "utils.py")
+            if not os.path.isfile(entry):
+                gate.fail("audiosr package", f"missing {entry}")
+            else:
+                gate.ok("audiosr package", entry)
+
+    required = [
+        "torch", "numpy", "scipy", "librosa", "soundfile", "einops", "yaml",
+        "matplotlib", "tqdm",
+    ]
+    if args.engine == "audiosr":
+        required += ["torchaudio", "safetensors", "transformers", "timm"]
+    missing = [name for name in required if not _module_available(name)]
+    if missing:
+        gate.fail("python deps", ", ".join(missing))
+    else:
+        gate.ok("python deps", ", ".join(required))
+
+    model_dir = os.path.expanduser(args.model_dir) if args.model_dir else default_model_dir(args.engine)
+    if args.engine == "flashsr":
+        missing_weights = [
+            name for name in FLASHSR_FILES if not os.path.isfile(os.path.join(model_dir, name))
+        ]
+        if missing_weights:
+            if args.download:
+                gate.warn("FlashSR weights", f"missing {', '.join(missing_weights)}; will download")
+            else:
+                gate.fail("FlashSR weights", f"missing {', '.join(missing_weights)} in {model_dir}")
+        else:
+            total = sum(os.path.getsize(os.path.join(model_dir, name)) for name in FLASHSR_FILES)
+            gate.ok("FlashSR weights", f"{total / 1e9:.2f} GB in {model_dir}")
+    else:
+        weight = os.path.join(model_dir, f"audiosr_{args.model}_fp32.safetensors")
+        if not os.path.isfile(weight):
+            gate.fail("AudioSR weights", f"missing {weight}")
+        else:
+            gate.ok("AudioSR weights", f"{os.path.getsize(weight) / 1e9:.2f} GB in {model_dir}")
+
+    if not _module_available("torch"):
+        _finish_gate(gate, args)
+        return None
+
+    import torch  # noqa: E402  (imported only after the gate checks above)
+
+    gate.ok("torch", f"{torch.__version__} (CUDA build {torch.version.cuda})")
+
+    device = args.device
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            gate.warn("CUDA", "unavailable, falling back to CPU (FlashSR will be very slow)")
+            device = "cpu"
+        else:
+            free, total = torch.cuda.mem_get_info()
+            name = torch.cuda.get_device_name(0)
+            detail = f"{name}, {free / 1e9:.1f} GB free / {total / 1e9:.1f} GB total"
+            if free < 3.5e9:
+                gate.warn("GPU", detail + " -- close ComfyUI/other GPU apps if loading fails")
+            else:
+                gate.ok("GPU", detail)
+            if total < 6e9:
+                gate.warn("GPU VRAM", f"{total / 1e9:.1f} GB total; FlashSR wants ~4.9 GB peak")
+    else:
+        gate.ok("device", "cpu (explicitly requested)")
+
+    running = subprocess.run(
+        ["pgrep", "-af", "ComfyUI/main.py"], capture_output=True, text=True
+    ).stdout.strip()
+    if running:
+        gate.warn("ComfyUI is running", "it may be holding VRAM; the run can still fit")
+
+    info = {
+        "comfyui": COMFYUI_DIR,
+        "venv_python": VENV_PYTHON,
+        "pkg_dir": pkg_dir,
+        "node_dir": node_dir,
+        "model_dir": model_dir,
+        "device": device,
+    }
+    if not _finish_gate(gate, args):
+        return None
+    return info
+
+
+def _finish_gate(gate, args):
+    if gate.failures:
+        print("[audiosr] Preflight failed:")
+        for failure in gate.failures:
+            print(f"  - {failure}")
+        if args.engine == "flashsr":
+            print(
+                "\n[audiosr] Missing FlashSR weights? Re-run with --download:\n"
+                f"  {FLASHSR_URL.format(repo=FLASHSR_REPO, name='student_ldm.pth')}\n"
+                f"  {FLASHSR_URL.format(repo=FLASHSR_REPO, name='sr_vocoder.pth')}\n"
+                f"  {FLASHSR_URL.format(repo=FLASHSR_REPO, name='vae.pth')}"
+            )
+        return False
+    print("[audiosr] Preflight OK")
+    if not args.check:
+        print()
+    return True
+
+
+def download_flashsr_weights(model_dir):
+    os.makedirs(model_dir, exist_ok=True)
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        sys.exit("[audiosr] huggingface_hub is not installed in this Python environment")
+    for name in FLASHSR_FILES:
+        dest = os.path.join(model_dir, name)
+        if os.path.isfile(dest):
+            continue
+        print(f"[audiosr] Downloading {name} ({FLASHSR_SIZES[name] / 1e9:.2f} GB)...", flush=True)
+        hf_hub_download(
+            repo_id=FLASHSR_REPO,
+            filename=name,
+            local_dir=model_dir,
+            repo_type="dataset",
+        )
+        print(f"[audiosr] Downloaded {name}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# FlashSR
+# ---------------------------------------------------------------------------
+
+def load_flashsr(pkg_dir, model_dir, device):
+    if pkg_dir not in sys.path:
+        sys.path.insert(0, pkg_dir)
+
+    import torch
+    from FlashSR.FlashSR import FlashSR
+
+    # The published checkpoints were saved from CUDA tensors and FlashSR's
+    # constructor calls torch.load() without map_location, which raises on a
+    # CPU-only machine. Pin the mapping while the weights are read.
+    original_load = torch.load
+    if torch.device(device).type == "cpu":
+        def cpu_load(*args, **kwargs):
+            kwargs.setdefault("map_location", "cpu")
+            return original_load(*args, **kwargs)
+
+        torch.load = cpu_load
+    try:
+        model = FlashSR(
+            os.path.join(model_dir, "student_ldm.pth"),
+            os.path.join(model_dir, "sr_vocoder.pth"),
+            os.path.join(model_dir, "vae.pth"),
+        )
+    finally:
+        torch.load = original_load
+    model.eval()
+    return model.to(device)
+
+
+def _rms(x):
+    import numpy as np
+
+    return float(np.sqrt(np.mean(np.asarray(x, dtype=np.float64) ** 2) + 1e-12))
+
+
+def upscale_flashsr(model, waveform, args):
+    """Run FlashSR over fixed 5.12 s windows with crossfaded overlap."""
+    import numpy as np
+    import torch
+    from FlashSR.Util.UtilAudioSR import UtilAudioSR
+
+    num_channels, num_samples = waveform.shape
+    if num_channels > 2:
+        # The lowpass helper accepts only mono/stereo; process extra channels one at a time.
+        return np.stack([
+            upscale_flashsr(model, waveform[channel:channel + 1], args)[0]
+            for channel in range(num_channels)
+        ])
+    overlap = int(round(args.overlap * SAMPLE_RATE))
+    overlap = max(0, min(overlap, FLASHSR_WINDOW - 1))
+    step = FLASHSR_WINDOW - overlap
+
+    starts = list(range(0, num_samples, step))
+    pad = max(0, starts[-1] + FLASHSR_WINDOW - num_samples)
+    padded = np.pad(waveform, ((0, 0), (0, pad)), mode="constant") if pad else waveform
+
+    reconstructed = np.zeros((num_channels, padded.shape[1]), dtype=np.float64)
+    weight_sum = np.zeros((num_channels, padded.shape[1]), dtype=np.float64)
+
+    param = next(model.parameters())
+    device, dtype = param.device, param.dtype
+    started = time.time()
+
+    for index, start in enumerate(starts):
+        chunk = padded[:, start:start + FLASHSR_WINDOW]
+        tensor = torch.from_numpy(chunk).to(device=device, dtype=dtype)
+        lowpass = args.lowpass
+        if lowpass:
+            # find_cutoff_freq reports 24000 for windows with no usable low band
+            # (near-silence). That is above Nyquist and cheby1 rejects it.
+            cutoff = UtilAudioSR.find_cutoff_freq(tensor)
+            if cutoff >= SAMPLE_RATE // 2:
+                lowpass = False
+                print(
+                    f"[audiosr] window {index + 1}/{len(starts)}: no usable low band, skipping lowpass",
+                    flush=True,
+                )
+        with torch.no_grad():
+            out = model(tensor, num_steps=1, lowpass_input=lowpass)
+        out = out.float().cpu().numpy()
+        if out.ndim == 1:
+            out = out[np.newaxis, :]
+
+        valid = min(FLASHSR_WINDOW, num_samples - start)
+        for channel in range(num_channels):
+            level = _rms(out[channel, :valid])
+            reference = _rms(chunk[channel, :valid])
+            if level > 1e-6 and reference > 1e-5:
+                out[channel] *= min(max(reference / level, 0.2), 5.0)
+
+        weights = np.ones(FLASHSR_WINDOW, dtype=np.float64)
+        if overlap > 0 and index > 0:
+            t = np.linspace(0.0, 1.0, overlap, endpoint=False)
+            weights[:overlap] *= 0.5 * (1.0 - np.cos(np.pi * t))
+        if overlap > 0 and index < len(starts) - 1:
+            t = np.linspace(0.0, 1.0, overlap, endpoint=False)
+            weights[-overlap:] *= 0.5 * (1.0 + np.cos(np.pi * t))
+
+        reconstructed[:, start:start + FLASHSR_WINDOW] += out * weights
+        weight_sum[:, start:start + FLASHSR_WINDOW] += weights
+
+        elapsed = time.time() - started
+        eta = elapsed / (index + 1) * (len(starts) - index - 1)
+        print(
+            f"[audiosr] window {index + 1}/{len(starts)} "
+            f"({start / SAMPLE_RATE:.1f}s, {elapsed:.0f}s elapsed, ~{eta:.0f}s left)",
+            flush=True,
+        )
+
+    nonzero = weight_sum > 0
+    reconstructed[nonzero] /= weight_sum[nonzero]
+    result = reconstructed[:, :num_samples]
+
+    peak = float(np.max(np.abs(result))) if result.size else 0.0
+    if peak > 0.99:
+        result *= 0.99 / peak
+    return result.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# AudioSR (VASR) fallback engine
+# ---------------------------------------------------------------------------
+
+def _trim_vasr(model):
+    """Drop the EMA copy and the conditioning VAE decoder/vocoder (unused)."""
+    model.model_ema = None
+    for cond in model.cond_stage_models:
+        if getattr(cond, "vae", None) is not None:
+            cond.vae.decoder = None
+            cond.vae.vocoder = None
+
+
+def load_audiosr(node_dir, model_dir, model_name, device):
+    import torch
+    from safetensors.torch import load_file
+    from versatile_audio_super_resolution.audiosr.latent_diffusion.models.ddpm import LatentDiffusion
+    from versatile_audio_super_resolution.audiosr.utils import default_audioldm_config
+
+    config = default_audioldm_config(model_name)
+    config["model"]["params"]["device"] = device
+    model = LatentDiffusion(**config["model"]["params"])
+    model.load_state_dict(load_file(os.path.join(model_dir, f"audiosr_{model_name}_fp32.safetensors"), device="cpu"), strict=False)
+    model.eval()
+    _trim_vasr(model)
+    return model.to(device)
+
+
+def _vasr_generate(model, channel, args, duration):
+    import numpy as np
+    import torch
+    from versatile_audio_super_resolution.audiosr.pipeline import make_batch_for_super_resolution
+
+    batch, _ = make_batch_for_super_resolution(None, waveform=np.expand_dims(channel, 0))
+    out = model.generate_batch(
+        batch,
+        unconditional_guidance_scale=args.guidance,
+        ddim_steps=args.steps,
+        duration=duration,
+    )
+    if isinstance(out, np.ndarray):
+        out = torch.from_numpy(out)
+    out = out.squeeze()
+    if out.ndim > 1:
+        out = out.flatten()
+    return out.float().cpu().numpy()
+
+
+def upscale_audiosr(model, waveform, args):
+    import numpy as np
+    from versatile_audio_super_resolution.audiosr.pipeline import seed_everything
+
+    seed_everything(args.seed or 1)
+    output = []
+    for index, channel in enumerate(waveform):
+        label = "mono" if waveform.shape[0] == 1 else ("L" if index == 0 else "R" if index == 1 else f"ch{index + 1}")
+        output.append(_upscale_vasr_channel(model, channel, args, label))
+    return np.stack(output, axis=0).astype(np.float32)
+
+
+def _upscale_vasr_channel(model, channel, args, label):
+    import numpy as np
+
+    duration = len(channel) / SAMPLE_RATE
+    if duration <= VASR_MAX_DIRECT:
+        t0 = time.time()
+        out = _vasr_generate(model, channel, args, duration)[:len(channel)]
+        print(f"[audiosr] {label}: {duration:.1f}s in {time.time() - t0:.1f}s", flush=True)
+        return out
+
+    chunk_samples = int(args.chunk_size * SAMPLE_RATE)
+    overlap_samples = int(args.overlap * SAMPLE_RATE)
+    min_samples = int(VASR_MIN_CHUNK * SAMPLE_RATE)
+    if overlap_samples >= chunk_samples:
+        sys.exit("[audiosr] --overlap must be smaller than --chunk-size")
+
+    chunks = []
+    start = 0
+    while start < len(channel):
+        end = min(start + chunk_samples, len(channel))
+        chunk = channel[start:end]
+        padded = len(chunk) < min_samples
+        if padded:
+            chunk = np.pad(chunk, (0, min_samples - len(chunk)), mode="constant")
+        chunks.append((chunk, start, end, padded))
+        start += chunk_samples - overlap_samples
+
+    reconstructed = np.zeros(len(channel))
+    weight_sum = np.zeros(len(channel))
+
+    for index, (chunk, start, end, padded) in enumerate(chunks):
+        print(f"[audiosr] {label} chunk {index + 1}/{len(chunks)}", flush=True)
+        out = _vasr_generate(model, chunk, args, len(chunk) / SAMPLE_RATE)
+        length = end - start
+        out = out[:length] if len(out) > length else np.pad(out, (0, length - len(out)))
+
+        weights = np.ones(length)
+        if overlap_samples > 0 and index < len(chunks) - 1:
+            fade = min(overlap_samples, length)
+            window = np.linspace(1.0, 0.0, fade)
+            out[-fade:] *= window
+            weights[-fade:] *= window
+        if overlap_samples > 0 and index > 0:
+            fade = min(overlap_samples, length)
+            window = np.linspace(0.0, 1.0, fade)
+            out[:fade] *= window
+            weights[:fade] *= window
+
+        reconstructed[start:end] += out
+        weight_sum[start:end] += weights
+
+    nonzero = weight_sum > 0
+    reconstructed[nonzero] /= weight_sum[nonzero]
+    return reconstructed
+
+
+# ---------------------------------------------------------------------------
+# Streaming playback (mp3 -> FlashSR -> PulseAudio, no intermediate file)
+# ---------------------------------------------------------------------------
+
+def probe_audio(path):
+    """Return (channels, duration_seconds) for the first audio stream."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=channels", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        sys.exit(f"[audiosr] ffprobe failed: {proc.stderr.strip()}")
+    values = [line for line in proc.stdout.split() if line.strip()]
+    try:
+        channels = int(values[0])
+        duration = float(values[1]) if len(values) > 1 else 0.0
+    except (IndexError, ValueError):
+        sys.exit(f"[audiosr] could not parse ffprobe output: {proc.stdout!r}")
+    return channels, duration
+
+
+def _pcm_blocks(proc, channels):
+    """Yield float32 blocks from a process emitting raw 48 kHz f32le PCM."""
+    import numpy as np
+
+    frame = 4 * channels
+    try:
+        while True:
+            block = proc.stdout.read(frame * 4096)
+            if not block:
+                break
+            usable = len(block) - (len(block) % frame)
+            if usable:
+                yield np.frombuffer(block[:usable], dtype=np.float32).reshape(-1, channels).T
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
+def decode_pcm(path, channels):
+    """Decode a file to 48 kHz float32 blocks via ffmpeg."""
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-nostdin", "-i", path, "-map", "a:0",
+         "-f", "f32le", "-acodec", "pcm_f32le",
+         "-ar", str(SAMPLE_RATE), "-ac", str(channels), "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    yield from _pcm_blocks(proc, channels)
+
+
+def open_sink(args, channels, label):
+    """Return (write, close) callables for the chosen output."""
+    if args.dump:
+        import soundfile as sf
+        handle = sf.SoundFile(args.dump, "w", samplerate=SAMPLE_RATE,
+                              channels=channels, format="FLAC", subtype="PCM_24")
+
+        def write(block):
+            handle.write(block.T)
+
+        def close():
+            handle.close()
+            print(f"[audiosr] Wrote {args.dump}")
+
+        return write, close
+
+    cmd = [
+        "pacat", "--playback", "--raw",
+        f"--format=float32le", f"--rate={SAMPLE_RATE}", f"--channels={channels}",
+        f"--latency-msec={args.latency}", f"--stream-name={label}",
+        f"--device={args.sink}",
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+
+    def write(block):
+        import numpy as np
+
+        proc.stdin.write(np.ascontiguousarray(block.T, dtype=np.float32).tobytes())
+        proc.stdin.flush()
+
+    def close():
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+        proc.wait()
+
+    return write, close
+
+
+def _xfade(n, fade_in):
+    """Raised-cosine ramp of length n, rising or falling."""
+    import numpy as np
+
+    t = np.linspace(0.0, 1.0, n, endpoint=False, dtype=np.float64)
+    return 0.5 * (1.0 - np.cos(np.pi * t)) if fade_in else 0.5 * (1.0 + np.cos(np.pi * t))
+
+
+def _silence_tqdm():
+    """FlashSR's sampler draws a tqdm bar per window.
+
+    A one-step model does not need a progress bar, and it would interleave with
+    the streaming status lines. The bars live in module-level `tqdm` names bound
+    at import time, so they are patched after the model is loaded.
+    """
+    stubs = [
+        ("TorchJaekwon.Model.Diffusion.DDPM.DDPM", "tqdm"),
+        ("TorchJaekwon.Model.Diffusion.External.diffusers.DiffusersWrapper", "tqdm"),
+    ]
+    for module_name, attribute in stubs:
+        module = sys.modules.get(module_name)
+        if module is not None:
+            setattr(module, attribute, lambda iterable=None, *a, **k: iterable if iterable is not None else [])
+
+
+def stream_upscale(model, blocks, args, channels):
+    """Turn a block iterator into a crossfaded 48 kHz output stream.
+
+    Windows advance by (window - overlap) samples. The tail of each window is
+    held back and blended with the head of the next one, so the listener never
+    hears a seam and the emitted sample count matches the input exactly.
+    """
+    import contextlib
+
+    import numpy as np
+    import torch
+    from FlashSR.Util.UtilAudioSR import UtilAudioSR
+
+    window = int(round(args.window * SAMPLE_RATE))
+    overlap = int(round(args.overlap * SAMPLE_RATE))
+    overlap = max(0, min(overlap, window // 2 - 1))
+    step = window - overlap
+
+    param = next(model.parameters())
+    device = param.device
+    if args.dtype == "bf16" and device.type == "cuda":
+        amp = torch.autocast("cuda", dtype=torch.bfloat16)
+    else:
+        amp = contextlib.nullcontext()
+
+    gain = None
+    tail = None
+    lowpass = args.lowpass
+    cutoff = args.cutoff
+    buffered = np.zeros((channels, 0), dtype=np.float32)
+    index = 0
+    started = time.time()
+    done = False
+
+    while not done:
+        while buffered.shape[1] < window:
+            try:
+                block = next(blocks)
+            except StopIteration:
+                done = True
+                break
+            buffered = np.concatenate([buffered, block], axis=1)
+        if buffered.shape[1] == 0:
+            break
+
+        valid = min(window, buffered.shape[1])
+        chunk = buffered[:, :valid]
+        if valid < window:
+            chunk = np.pad(chunk, ((0, 0), (0, window - valid)), mode="constant")
+        buffered = buffered[:, min(step, valid):]
+
+        tensor = torch.from_numpy(np.ascontiguousarray(chunk)).to(device)
+        silent = args.skip_silence and _rms(chunk[:, :valid]) < 1e-6
+        if silent:
+            # Nothing but digital silence (the daemon idles this way): pass it
+            # through without spending a forward pass on the GPU.
+            out = np.zeros((channels, valid), dtype=np.float32)
+        else:
+            # Detect the low band once and reuse it: re-detecting per window
+            # makes the cutoff (and so the timbre) jump around, and a silent
+            # window reports 24 kHz, which cheby1 refuses.
+            if lowpass and cutoff is None:
+                detected = UtilAudioSR.find_cutoff_freq(tensor)
+                if detected >= SAMPLE_RATE // 2:
+                    lowpass = False
+                else:
+                    cutoff = detected
+            with torch.no_grad(), amp:
+                out = model(tensor, num_steps=1, lowpass_input=lowpass, lowpass_cutoff_freq=cutoff)
+            out = out.float().cpu().numpy()[:, :valid]
+
+            # Keep the output level glued to the input level so windows do not pump.
+            reference, level = _rms(chunk[:, :valid]), _rms(out)
+            if level > 1e-6 and reference > 1e-5:
+                target = min(max(reference / level, 0.2), 5.0)
+                # Seed from the first window; an EMA from 1.0 would make short
+                # files 2-3 dB quiet at the start before it converges.
+                gain = target if gain is None else 0.5 * gain + 0.5 * target
+            out = out * (gain if gain is not None else 1.0)
+
+        last = done and buffered.shape[1] == 0
+        if overlap and tail is not None:
+            blend = min(overlap, valid, tail.shape[1])
+            out[:, :blend] = tail[:, :blend] * _xfade(blend, False) + out[:, :blend] * _xfade(blend, True)
+            yield out[:, :valid - overlap] if not last else out
+            tail = out[:, valid - overlap:valid].copy() if not last else None
+        else:
+            if overlap and not last:
+                yield out[:, :valid - overlap]
+                tail = out[:, valid - overlap:valid].copy()
+            else:
+                yield out
+                tail = None
+
+        index += 1
+        if last:
+            break
+        if index % 4 == 0:
+            elapsed = time.time() - started
+            produced = index * step / SAMPLE_RATE
+            print(f"[audiosr] {produced:6.1f}s streamed in {elapsed:6.1f}s "
+                  f"(RTF {elapsed / produced:.2f})", flush=True)
+
+    if tail is not None and tail.size:
+        yield tail
+
+
+def _pactl(*args, capture=False):
+    return subprocess.run(["pactl", *args], capture_output=capture, text=True)
+
+
+def listen(args):
+    """Middleware mode: create a virtual sink, upscale whatever is routed to it.
+
+    Any application can then play into the sink (or set it as the default) and
+    hear 48 kHz upscaled audio. The output goes to the real sink that was the
+    default when the daemon started, so the daemon never feeds itself.
+    """
+    info = preflight(args)
+    if info is None:
+        return 1
+
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    window = int(round(args.window * SAMPLE_RATE))
+    if window % FLASHSR_GRANULE or window < FLASHSR_GRANULE:
+        sys.exit(
+            f"[audiosr] --window must be a multiple of {FLASHSR_GRANULE / SAMPLE_RATE:.2f}s "
+            f"and at least that long; got {args.window}s"
+        )
+
+    virtual = args.virtual_name
+    original_default = _pactl("get-default-sink", capture=True).stdout.strip()
+    target = args.sink if args.sink != "@DEFAULT_SINK@" else original_default
+    if target == virtual:
+        sys.exit(f"[audiosr] refusing to play into the virtual sink {virtual} (feedback loop)")
+    # Pin the output now: with --take-default the default becomes the virtual
+    # sink, and anything resolving @DEFAULT_SINK@ later would loop back into us.
+    args.sink = target
+
+    module = _pactl(
+        "load-module", "module-null-sink",
+        f"sink_name={virtual}",
+        f"rate={SAMPLE_RATE}", "channels=2",
+        f"sink_properties=device.description=AudioSR_48k",
+        capture=True,
+    ).stdout.strip()
+    if not module.isdigit():
+        sys.exit(f"[audiosr] could not create the virtual sink: {module}")
+
+    if args.take_default:
+        _pactl("set-default-sink", virtual)
+
+    print(f"[audiosr] Virtual sink: {virtual}  (module {module})")
+    print(f"[audiosr] Playing into: {target}")
+    if args.take_default:
+        print(f"[audiosr] {virtual} is now the default sink; on exit it is restored to "
+              f"{original_default} (or run: pactl set-default-sink {original_default})")
+    print(f"[audiosr] Route an app with: pactl move-sink-input <id> {virtual}")
+    print(f"[audiosr] Window {args.window}s -> ~{args.window + 1.9:.1f}s latency. Ctrl-C to stop.",
+          flush=True)
+
+    # SIGTERM must run the cleanup path too, or the virtual sink is left behind.
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _on_term)
+
+    source = subprocess.Popen(
+        ["parec", f"--device={virtual}.monitor", "--format=float32le",
+         f"--rate={SAMPLE_RATE}", "--channels=2", "--latency-msec=200"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+
+    started = time.time()
+    write, close = open_sink(args, 2, f"audiosr-sink: {virtual}")
+    queue_ = queue.Queue(maxsize=1)
+    failures = []
+
+    def writer():
+        try:
+            while True:
+                block = queue_.get()
+                if block is None:
+                    break
+                for start in range(0, block.shape[1], WRITE_CHUNK):
+                    write(block[:, start:start + WRITE_CHUNK])
+        except Exception as exc:
+            failures.append(exc)
+        finally:
+            close()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+
+    model = load_flashsr(info["pkg_dir"], info["model_dir"], info["device"])
+    _silence_tqdm()
+    print(f"[audiosr] Model loaded in {time.time() - started:.1f}s, listening...", flush=True)
+
+    try:
+        for block in stream_upscale(model, _pcm_blocks(source, 2), args, 2):
+            if failures:
+                break
+            queue_.put(block)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        source.terminate()
+        queue_.put(None)
+        thread.join()
+        if args.take_default and original_default:
+            _pactl("set-default-sink", original_default)
+            print(f"[audiosr] Default sink restored to {original_default}")
+        _pactl("unload-module", module)
+        print("[audiosr] Virtual sink removed")
+    return 0
+
+
+def play(args):
+    """Stream an audio file through FlashSR into a PulseAudio sink (or FLAC)."""
+    info = preflight(args)
+    if info is None:
+        return 1
+
+    import warnings
+
+    warnings.filterwarnings("ignore")
+
+    if not args.input:
+        sys.exit("[audiosr] No input file given")
+    if not os.path.exists(args.input):
+        sys.exit(f"[audiosr] Input not found: {args.input}")
+
+    channels, duration = probe_audio(args.input)
+    window = int(round(args.window * SAMPLE_RATE))
+    if window % FLASHSR_GRANULE:
+        sys.exit(
+            f"[audiosr] --window must be a multiple of {FLASHSR_GRANULE / SAMPLE_RATE:.2f}s "
+            f"(the model's granularity); got {args.window}s"
+        )
+    if window < FLASHSR_GRANULE:
+        sys.exit(f"[audiosr] --window must be at least {FLASHSR_GRANULE / SAMPLE_RATE:.2f}s")
+    if args.overlap * SAMPLE_RATE >= window / 2:
+        sys.exit("[audiosr] --overlap must be less than half the window")
+
+    print(f"[audiosr] Engine: FlashSR (1-step, {args.dtype}), window={args.window}s, "
+          f"overlap={args.overlap}s, {channels}ch")
+    print(f"[audiosr] Input:  {args.input} ({duration:.1f}s)")
+    if not args.dump:
+        print(f"[audiosr] Sink:   {args.sink}")
+        print(f"[audiosr] Latency: ~{args.window + 1.9:.1f}s "
+              f"(window buffer + inference at RTF 0.37)")
+
+    started = time.time()
+    label = f"audiosr: {os.path.basename(args.input)[:48]}"
+    write, close = open_sink(args, channels, label)
+
+    # The sink only accepts audio at playback rate, so writes block. Push them
+    # onto a writer thread: otherwise the blocking write serializes with
+    # inference and the stream falls behind realtime. Opening the sink first
+    # also starts the device resuming while the weights load.
+    queue_ = queue.Queue(maxsize=1)
+    failures = []
+
+    def writer():
+        try:
+            while True:
+                block = queue_.get()
+                if block is None:
+                    break
+                for start in range(0, block.shape[1], WRITE_CHUNK):
+                    write(block[:, start:start + WRITE_CHUNK])
+        except Exception as exc:  # broken pipe when the listener goes away
+            failures.append(exc)
+        finally:
+            close()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+
+    model = load_flashsr(info["pkg_dir"], info["model_dir"], info["device"])
+    _silence_tqdm()
+    print(f"[audiosr] Model loaded in {time.time() - started:.1f}s, streaming...", flush=True)
+
+    total = 0
+    interrupted = False
+    try:
+        for block in stream_upscale(model, decode_pcm(args.input, channels), args, channels):
+            if failures:
+                break
+            queue_.put(block)
+            total += block.shape[1]
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        queue_.put(None)
+        thread.join()
+
+    if failures and not interrupted:
+        print(f"[audiosr] Playback stopped: {failures[0]}")
+        return 1
+    if interrupted:
+        print("\n[audiosr] Interrupted")
+        return 130
+
+    print(f"[audiosr] Done: {total / SAMPLE_RATE:.1f}s of 48 kHz audio "
+          f"in {time.time() - started:.1f}s")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Upscale audio to 48 kHz with FlashSR (default) or AudioSR.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("input", nargs="?", help="input audio file (mp3, wav, flac, ...)")
+    parser.add_argument("output", nargs="?", help="output .flac path (default: input with .flac)")
+    parser.add_argument("--engine", default="flashsr", choices=["flashsr", "audiosr"],
+                        help="flashsr is one-step and ~9x faster; audiosr is the diffusion sampler")
+    parser.add_argument("--model", default="basic", choices=["basic", "speech"],
+                        help="[audiosr only] weight variant")
+    parser.add_argument("--steps", type=int, default=50, help="[audiosr only] denoising steps")
+    parser.add_argument("--guidance", type=float, default=3.5, help="[audiosr only] CFG scale")
+    parser.add_argument("--seed", type=int, default=0, help="[audiosr only] seed, 0 = random")
+    parser.add_argument("--chunk-size", type=float, default=15.0,
+                        help="[audiosr only] chunk length in seconds")
+    parser.add_argument("--overlap", type=float, default=1.0,
+                        help="overlap between chunks/windows in seconds")
+    parser.add_argument("--lowpass", action=argparse.BooleanOptionalAction, default=True,
+                        help="[flashsr only] lowpass the input and auto-detect the cutoff")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
+                        help="compute device")
+    parser.add_argument("--model-dir", default=None,
+                        help="weights directory (default: $FLASHSR_MODEL_DIR, ./models, "
+                             "or the ComfyUI models directory)")
+    parser.add_argument("--node-dir", default=None,
+                        help="directory containing the FlashSR package "
+                             "(default: $FLASHSR_DIR, ./flashsr, or a ComfyUI install)")
+    parser.add_argument("--sample-rate", type=int, default=SAMPLE_RATE,
+                        help="output sample rate")
+    parser.add_argument("--normalize", action="store_true",
+                        help="peak-normalize output to -0.1 dBFS")
+    parser.add_argument("--download", action="store_true",
+                        help="download missing FlashSR weights from HuggingFace")
+    parser.add_argument("--check", action="store_true",
+                        help="run the install/GPU/model preflight gate and exit")
+    parser.add_argument("--play", action="store_true",
+                        help="stream through FlashSR to a PulseAudio/PipeWire sink "
+                             "instead of writing a file")
+    parser.add_argument("--sink", default="@DEFAULT_SINK@",
+                        help="[--play] PulseAudio sink name (pacat --device)")
+    parser.add_argument("--window", type=float, default=5.12,
+                        help="[--play] FlashSR window in seconds (multiple of 0.64; "
+                             "5.12 = trained length, smaller = lower latency)")
+    parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"],
+                        help="[--play] compute precision (bf16 is ~17%% faster)")
+    parser.add_argument("--cutoff", type=float, default=None,
+                        help="[--play] fixed lowpass cutoff in Hz (default: auto, "
+                             "detected once from the first window)")
+    parser.add_argument("--latency", type=int, default=500,
+                        help="[--play] requested sink latency in ms")
+    parser.add_argument("--dump", default=None,
+                        help="[--play] write the streamed result to this FLAC "
+                             "instead of playing it")
+    parser.add_argument("--listen", action="store_true",
+                        help="middleware mode: create a virtual sink, upscale whatever "
+                             "is routed into it, and play it on the real sink")
+    parser.add_argument("--virtual-name", default="audiosr_in",
+                        help="[--listen] name of the virtual sink to create")
+    parser.add_argument("--skip-silence", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="pass digital silence through without a GPU pass "
+                             "(keeps the daemon idle when nothing is playing)")
+    parser.add_argument("--take-default", action="store_true",
+                        help="[--listen] make the virtual sink the default while running")
+    parser.epilog = (
+        "The FlashSR package is looked up in $FLASHSR_DIR, ./flashsr, "
+        "./vendor/flashsr, and ComfyUI custom_nodes (set COMFYUI_DIR or "
+        "FLASHSR_DIR to override). Weights come from $FLASHSR_MODEL_DIR, "
+        "./models, or the ComfyUI models directory; --download fetches them."
+    )
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
+    reexec_with_venv()
+
+    if args.listen:
+        return listen(args)
+    if args.play:
+        return play(args)
+
+    info = preflight(args)
+    if info is None:
+        return 1
+    if args.check:
+        return 0
+
+    if not args.input:
+        sys.exit("[audiosr] No input file given (or use --check)")
+    if not os.path.exists(args.input):
+        sys.exit(f"[audiosr] Input not found: {args.input}")
+
+    if args.engine == "flashsr" and args.download:
+        download_flashsr_weights(info["model_dir"])
+        missing = [
+            name for name in FLASHSR_FILES
+            if not os.path.isfile(os.path.join(info["model_dir"], name))
+        ]
+        if missing:
+            sys.exit(f"[audiosr] Download incomplete; still missing: {', '.join(missing)}")
+
+    output = args.output or os.path.splitext(args.input)[0] + ".flac"
+    output_dir = os.path.dirname(os.path.abspath(output))
+    os.makedirs(output_dir, exist_ok=True)
+
+    import warnings
+
+    warnings.filterwarnings("ignore")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+    import librosa
+    import numpy as np
+    import soundfile as sf
+    import torch
+
+    device = info["device"]
+    if args.engine == "flashsr":
+        print(f"[audiosr] Engine: FlashSR (1-step), lowpass={args.lowpass}, overlap={args.overlap}s")
+    else:
+        print(f"[audiosr] Engine: AudioSR {args.model}, steps={args.steps}, "
+              f"guidance={args.guidance}, overlap={args.overlap}s")
+
+    print(f"[audiosr] Input:  {args.input}")
+    print(f"[audiosr] Output: {output}")
+    print(f"[audiosr] Loading audio at {SAMPLE_RATE} Hz...", flush=True)
+    data, _ = librosa.load(args.input, sr=SAMPLE_RATE, mono=False)
+    if data.ndim == 1:
+        data = data[np.newaxis, :]
+    print(f"[audiosr] Loaded {data.shape[1] / SAMPLE_RATE:.1f}s, {data.shape[0]} channel(s)")
+
+    started = time.time()
+    if args.engine == "flashsr":
+        print("[audiosr] Loading FlashSR weights...", flush=True)
+        model = load_flashsr(info["pkg_dir"], info["model_dir"], device)
+        print(f"[audiosr] Model loaded in {time.time() - started:.1f}s", flush=True)
+        audio = upscale_flashsr(model, data, args)
+    else:
+        print("[audiosr] Loading AudioSR weights...", flush=True)
+        model = load_audiosr(info["node_dir"], info["model_dir"], args.model, device)
+        print(f"[audiosr] Model loaded in {time.time() - started:.1f}s", flush=True)
+        audio = upscale_audiosr(model, data, args)
+
+    if args.sample_rate != SAMPLE_RATE:
+        audio = np.stack(
+            [librosa.resample(channel, orig_sr=SAMPLE_RATE, target_sr=args.sample_rate) for channel in audio],
+            axis=0,
+        )
+
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    peak = float(np.max(np.abs(audio)))
+    if args.normalize and peak > 0:
+        audio *= 0.9886 / peak
+        print(f"[audiosr] Peak normalized from {peak:.2f} to 0.99")
+    elif peak > 1.0:
+        print(f"[audiosr] Peak {peak:.2f} exceeds 0 dBFS, FLAC write will clip it (use --normalize)")
+
+    sf.write(output, audio.T, args.sample_rate, subtype="PCM_24")
+    print(f"[audiosr] Done in {time.time() - started:.1f}s -> {output}")
+    print(f"[audiosr] {audio.shape[1] / args.sample_rate:.1f}s, {audio.shape[0]}ch, "
+          f"{args.sample_rate} Hz, 24-bit FLAC")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

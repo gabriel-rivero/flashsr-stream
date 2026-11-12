@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# audiosr-play: play an audio file through FlashSR as a 48 kHz PulseAudio stream.
+#
+# Thin wrapper around `audiosr --play`. The file is decoded with ffmpeg, upscaled
+# window by window on the GPU, and written straight into a PulseAudio/PipeWire
+# playback stream -- nothing is written to disk, and the stream shows up in the
+# mixer as "audiosr: <filename>".
+#
+# Usage: audiosr-play track.mp3 [--window 2.56] [--sink NAME] [--dump out.flac]
+#        audiosr-play --list-sinks
+#        audiosr-play track.mp3 --help          (full option list)
+#
+# Latency is roughly window + 1.9 s of inference; 5.12 s (the trained window) is
+# the quality default, 1.28-2.56 s trades context for responsiveness. This is
+# music/podcast tooling: it cannot track video lip-sync.
+set -euo pipefail
+
+if [[ "${1:-}" == "--list-sinks" ]]; then
+  pactl list short sinks | awk '{printf "%-58s %s\n", $2, $4" "$5}'
+  exit 0
+fi
+
+exec "$(dirname "$(readlink -f "$0")")/audiosr" --play "$@"
